@@ -119,6 +119,64 @@ key = old
 	assert.Equal(t, "value-from-file\n", cfg.Section("sec").Key("key").String())
 }
 
+func TestEnvironmentToConfigPersistence(t *testing.T) {
+	t.Run("environment-provided keys are not persisted", func(t *testing.T) {
+		tmp := t.TempDir()
+		cfg, err := NewConfigProviderFromFile(tmp + "/app.ini")
+		assert.NoError(t, err)
+
+		fileEnv := tmp + "/the-file"
+		assert.NoError(t, os.WriteFile(fileEnv, []byte("value-from-file\n"), 0o644))
+		changed := EnvironmentToConfig(cfg, []string{
+			"GITEA__sec__existing=env-value",
+			"GITEA__sec__created=env-value",
+			"GITEA__sec__from_file__FILE=" + fileEnv,
+		})
+		assert.True(t, changed)
+		assert.NoError(t, cfg.SaveTo(tmp+"/saved.ini"))
+
+		// the in-memory config still holds the environment values
+		assert.Equal(t, "env-value", cfg.Section("sec").Key("existing").String())
+		assert.Equal(t, "env-value", cfg.Section("sec").Key("created").String())
+		assert.Equal(t, "value-from-file", cfg.Section("sec").Key("from_file").String())
+
+		// the saved config: "existing" is absent (the config file never had it, the empty
+		// section is dropped), "created" and "from_file" are absent
+		bs, err := os.ReadFile(tmp + "/saved.ini")
+		assert.NoError(t, err)
+		assert.Equal(t, "", string(bs))
+	})
+
+	t.Run("environment-provided keys kept when explicitly included", func(t *testing.T) {
+		tmp := t.TempDir()
+		cfg, err := NewConfigProviderFromFile(tmp + "/app.ini")
+		assert.NoError(t, err)
+		cfg.IncludeEnvConfigKeys()
+
+		changed := EnvironmentToConfig(cfg, []string{"GITEA__sec__created=env-value"})
+		assert.True(t, changed)
+		assert.NoError(t, cfg.SaveTo(tmp+"/saved.ini"))
+		bs, err := os.ReadFile(tmp + "/saved.ini")
+		assert.NoError(t, err)
+		assert.Equal(t, "[sec]\ncreated = env-value\n", string(bs))
+	})
+
+	t.Run("environment-provided values overlay config-file values without changing the file", func(t *testing.T) {
+		tmp := t.TempDir()
+		assert.NoError(t, os.WriteFile(tmp+"/app.ini", []byte("[sec]\nSECRET_TOKen = from-file\n"), 0o644))
+		cfg, err := NewConfigProviderFromFile(tmp + "/app.ini")
+		assert.NoError(t, err)
+
+		changed := EnvironmentToConfig(cfg, []string{"GITEA__sec__SECRET_TOKen=from-env"})
+		assert.True(t, changed)
+		assert.Equal(t, "from-env", cfg.Section("sec").Key("SECRET_TOKen").String())
+		assert.NoError(t, cfg.SaveTo(tmp+"/saved.ini"))
+		bs, err := os.ReadFile(tmp + "/saved.ini")
+		assert.NoError(t, err)
+		assert.Equal(t, "[sec]\nSECRET_TOKen = from-file\n", string(bs))
+	})
+}
+
 func TestEnvironmentToConfigSubSecKey(t *testing.T) {
 	// the INI package has a quirk: by default, the keys are inherited.
 	// when maintaining the keys, the newly added sub key should not be affected by the parent key.
@@ -130,6 +188,9 @@ key = some
 
 	changed := EnvironmentToConfig(cfg, []string{"GITEA__sec_0X2E_sub__key=some"})
 	assert.True(t, changed)
+
+	// this test is about the ini sub-section key quirk, not about the env-to-ini persistence
+	cfg.IncludeEnvConfigKeys()
 
 	tmpFile := t.TempDir() + "/test-sub-sec-key.ini"
 	defer os.Remove(tmpFile)

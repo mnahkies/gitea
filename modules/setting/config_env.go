@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gitea.dev/modules/log"
 )
@@ -21,6 +22,11 @@ const (
 const escapeRegexpString = "_0[xX](([0-9a-fA-F][0-9a-fA-F])+)_"
 
 var escapeRegex = regexp.MustCompile(escapeRegexpString)
+
+var (
+	dynEnvConfigVarsMu sync.Mutex
+	dynEnvConfigVars   = map[string]string{} // env name -> raw env value (may be a file path for the "__FILE" suffix), for re-injecting into a restarted process
+)
 
 func CollectEnvConfigKeys() (keys []string) {
 	for _, env := range os.Environ() {
@@ -123,6 +129,9 @@ func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 		if !ok {
 			continue
 		}
+		// remember this environment variable, it must be re-injected into a restarted
+		// process, since the values it provides are not persisted into the config file
+		recordDynEnvConfigVar(envKey, envValue)
 
 		// use environment value as config value, or read the file content as value if the key indicates a file
 		keyValue := envValue
@@ -150,7 +159,9 @@ func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 			}
 		}
 		key := ConfigSectionKey(section, keyName)
+		created := false
 		if key == nil {
+			created = true
 			changed = true
 			key, err = section.NewKey(keyName, keyValue)
 			if err != nil {
@@ -163,8 +174,48 @@ func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 			changed = true
 		}
 		key.SetValue(keyValue)
+		// remember that this key is provided by an environment variable, so its value
+		// stays in memory only and is never persisted into the config file
+		recordEnvConfigKeyIntoProvider(cfg, sectionName, keyName, !created, oldValue)
 	}
 	return changed
+}
+
+// recordEnvConfigKeyIntoProvider records that a config key is provided by an environment
+// variable. Fallback reflects the config-file value before the environment value was
+// applied: when the config provider is saved, the key is either omitted (created by an
+// environment variable: hasFallback=false) or reset to its config-file value
+// (hasFallback=true). The first registration wins, since later applications run on
+// already-overlaid configs where the "fallback" value would just be the previous
+// environment value.
+func recordEnvConfigKeyIntoProvider(cfg ConfigProvider, sectionName, keyName string, hasFallback bool, fallback string) {
+	p, ok := cfg.(*iniConfigProvider)
+	if !ok {
+		return
+	}
+	ck := envConfigKey{sectionName, keyName}
+	if _, exist := p.envConfigKeys[ck]; !exist {
+		p.envConfigKeys[ck] = envConfigValue{Fallback: fallback, HasFallback: hasFallback}
+	}
+}
+
+func recordDynEnvConfigVar(envKey, envValue string) {
+	dynEnvConfigVarsMu.Lock()
+	defer dynEnvConfigVarsMu.Unlock()
+	dynEnvConfigVars[envKey] = envValue
+}
+
+// DynEnvConfigVariables returns the environment variables which provide config values,
+// as "NAME=VALUE" pairs, to be re-injected into a restarted child process, because they
+// are unset in the current process (ClearEnvConfigKeys) but the restarted child needs
+// them again to overlay its config in memory.
+func DynEnvConfigVariables() (envs []string) {
+	dynEnvConfigVarsMu.Lock()
+	defer dynEnvConfigVarsMu.Unlock()
+	for k, v := range dynEnvConfigVars {
+		envs = append(envs, k+"="+v)
+	}
+	return envs
 }
 
 func UnsetUnnecessaryEnvVars() {

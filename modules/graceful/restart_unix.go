@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gitea.dev/modules/setting"
 )
 
 var killParent sync.Once
@@ -79,6 +81,9 @@ func RestartProcess() (int, error) {
 			env = append(env, v)
 		}
 	}
+	// the env-provided config values are not persisted into the config file, so re-inject
+	// them into the restarted process, they only exist in this process' memory (registry)
+	env = append(env, setting.DynEnvConfigVariables()...)
 	env = append(env, fmt.Sprintf("%s=%d", listenFDsEnv, len(listeners)))
 
 	if notifySocketAddr != "" {

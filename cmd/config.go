@@ -141,6 +141,8 @@ func runConfigEditIni(_ context.Context, c *cli.Command) error {
 	}
 
 	if c.Bool("apply-env") {
+		// this command explicitly writes the environment values into the config file
+		cfgOut.IncludeEnvConfigKeys()
 		if setting.EnvironmentToConfig(cfgOut, env) {
 			needWriteOut = true
 		}

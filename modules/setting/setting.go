@@ -98,6 +98,7 @@ func InitCfgProvider(file string) {
 	if CfgProvider, err = NewConfigProviderFromFile(file); err != nil {
 		log.Fatal("Unable to init config provider from %q: %v", file, err)
 	}
+	EnvironmentToConfig(CfgProvider, os.Environ())
 	CfgProvider.DisableSaving() // do not allow saving the CfgProvider into file, it will be polluted by the "MustXxx" calls
 }
 
