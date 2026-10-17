@@ -66,6 +66,26 @@ type ConfigProvider interface {
 	DisableSaving()
 	PrepareSaving() (ConfigProvider, error)
 	IsLoadedFromEmpty() bool
+
+	// IncludeEnvConfigKeys makes subsequent "Save"/"SaveTo" calls also persist config keys
+	// provided by environment variables. By default those keys are omitted: their values are
+	// provided on each start and must stay in memory only. Only opt in for tools which
+	// explicitly write environment values into a config file (e.g. "gitea config edit-ini --apply-env").
+	IncludeEnvConfigKeys()
+}
+
+// envConfigKey identifies a config key provided by an environment variable
+type envConfigKey struct {
+	Section, Key string
+}
+
+// envConfigValue records how an environment-provided value overlaid a config file,
+// to keep the environment value in memory only and never persist it into the file:
+// HasFallback is false for keys created by the environment (omitted when saving),
+// otherwise Fallback is the value from the config file (kept as-is when saving).
+type envConfigValue struct {
+	Fallback    string
+	HasFallback bool
 }
 
 type iniConfigProvider struct {
@@ -74,6 +94,8 @@ type iniConfigProvider struct {
 
 	disableSaving   bool // disable the "Save" method because the config options could be polluted
 	loadedFromEmpty bool // whether the file has not existed previously
+	omitEnvKeys     bool // omit config keys provided by environment variables when saving
+	envConfigKeys   map[envConfigKey]envConfigValue
 }
 
 type iniConfigSection struct {
@@ -255,6 +277,8 @@ func NewConfigProviderFromData(configContent string) (ConfigProvider, error) {
 	return &iniConfigProvider{
 		ini:             cfg,
 		loadedFromEmpty: true,
+		omitEnvKeys:     true,
+		envConfigKeys:   map[envConfigKey]envConfigValue{},
 	}, nil
 }
 
@@ -282,6 +306,8 @@ func NewConfigProviderFromFile(file string) (ConfigProvider, error) {
 		file:            file,
 		ini:             cfg,
 		loadedFromEmpty: loadedFromEmpty,
+		omitEnvKeys:     true,
+		envConfigKeys:   map[envConfigKey]envConfigValue{},
 	}, nil
 }
 
@@ -318,6 +344,48 @@ func (p *iniConfigProvider) DeleteSection(name string) {
 
 var errDisableSaving = errors.New("this config can't be saved, developers should prepare a new config to save")
 
+// envKeysParked temporarily holds in-memory values of environment-provided config keys
+// while saving, so that these values are never persisted into the config file
+type envKeysParked struct {
+	secName, keyName, value string
+}
+
+// parkEnvConfigKeys removes environment-provided values from the in-memory config,
+// so that the subsequent save doesn't write them into the file. The caller must run
+// the returned function to put the values back into the in-memory config.
+func (p *iniConfigProvider) parkEnvConfigKeys() (restore func()) {
+	if !p.omitEnvKeys || len(p.envConfigKeys) == 0 {
+		return func() {}
+	}
+
+	var parked []envKeysParked
+	for ck, record := range p.envConfigKeys {
+		sec, err := p.ini.GetSection(ck.Section)
+		if err != nil {
+			continue // the section doesn't exist in this config provider
+		}
+		key, err := sec.GetKey(ck.Key)
+		if err != nil {
+			continue // this provider doesn't hold the environment value (e.g. a freshly loaded config)
+		}
+		parked = append(parked, envKeysParked{sec.Name(), ck.Key, key.Value()})
+		if record.HasFallback {
+			key.SetValue(record.Fallback) // keep the config-file value, only the in-memory value is overriden
+		} else {
+			sec.DeleteKey(ck.Key) // the key only exists because of an environment variable
+			if sec.Name() != ini.DefaultSection && len(sec.Keys()) == 0 {
+				p.ini.DeleteSection(sec.Name())
+			}
+		}
+	}
+	return func() {
+		for _, pk := range parked {
+			sec := p.ini.Section(pk.secName)
+			_, _ = sec.NewKey(pk.keyName, pk.value)
+		}
+	}
+}
+
 // Save saves the content into file
 func (p *iniConfigProvider) Save() error {
 	if p.disableSaving {
@@ -332,6 +400,8 @@ func (p *iniConfigProvider) Save() error {
 			return fmt.Errorf("failed to create %q: %v", filename, err)
 		}
 	}
+	restore := p.parkEnvConfigKeys()
+	defer restore()
 	if err := p.ini.SaveTo(filename); err != nil {
 		return fmt.Errorf("failed to save %q: %v", filename, err)
 	}
@@ -354,7 +424,16 @@ func (p *iniConfigProvider) SaveTo(filename string) error {
 	if p.disableSaving {
 		return errDisableSaving
 	}
+	restore := p.parkEnvConfigKeys()
+	defer restore()
 	return p.ini.SaveTo(filename)
+}
+
+// IncludeEnvConfigKeys makes subsequent "Save"/"SaveTo" calls also persist config keys
+// provided by environment variables. Only for tools which explicitly write environment
+// values into a config file, e.g. "gitea config edit-ini --apply-env".
+func (p *iniConfigProvider) IncludeEnvConfigKeys() {
+	p.omitEnvKeys = false
 }
 
 // DisableSaving disables the saving function, use PrepareSaving to get clear config options.
